@@ -93,21 +93,27 @@ pyarrow. The checkpoint's own `encoding/` and `inference/` directories are impor
   keeps the chosen experts' packed E2M1 bytes and E8M0 scales byte for byte, slices the router rows and
   bias to match and renumbers the kept experts 0..191. Bit-exact, verified tensor by tensor against the
   source. (Same stage as the parent repo's A192 master; it writes ~152 GiB to `$V41_COLD`.)
-- **Thor CUDA build:** the parent repo's `v41_server` loads `POOL384` plus a keep-set JSON and reads only
-  the kept experts, so switching domains is a restart with a different JSON at the same bytes, kernels
-  and speed as A192. `ops/dom/assemble.py <mask.json> --out <dir>` alternatively cuts a plain 192-expert
+- **Thor CUDA build:** a `v41_server` build that loads `POOL384` plus a keep-set JSON reads only the kept
+  experts, so switching domains is a restart with a different JSON at the same bytes, kernels and speed as
+  A192. (That loader is not yet in the public parent repo; until it is, cut a checkpoint with s05.) `ops/dom/assemble.py <mask.json> --out <dir>` alternatively cuts a plain 192-expert
   Thor build from the pool (107 GiB, identical bytes).
 
 ## Results
 
-TODO: filled in after the D2 replay gate and the E evals have run on the Thor build.
+Phase-E evals were run on Thor with the chat template, greedy decoding and max_tokens 4096. The same items and the same
+config were used for every arm. Each mask is compared with A192p using an exact McNemar test on discordant pairs. The
+pre-registered release rule: a mask is released only if its pooled domain score beats A192p and no guard suite
+(IFEval, MMLU-Pro, tool-call parse, tool format) falls below A192p.
 
-| bucket | shipped candidate | keep-set sha256 | domain d_kl32 vs A192 (CI) | general kl32 vs A192 | domain task suite vs A192 |
-|---|---|---|---|---|---|
-| gamedev | TODO | TODO | TODO | TODO | TODO |
-| mlsys | TODO | TODO | TODO | TODO | TODO |
-| robotics | TODO | TODO | TODO | TODO | TODO |
-| quantum | TODO | TODO | TODO | TODO | TODO |
+| bucket | shipped mask | keep-set sha256 | domain kl32 (A192) | general kl32 (A192 0.508) | domain suite vs A192p | released |
+|---|---|---|---|---|---|---|
+| gamedev | anc_k8 | `448ded42` | 0.095 (0.328) | 0.591 | Rust 115 vs 12 /150, C++ 135 vs 132; pooled p 7e-28 | yes |
+| mlsys | anc_k4 | `fb72251e` | 0.251 (0.284) | 0.537 | KernelBench L1 53 vs 32 /100, p 5e-5 | yes |
+| robotics | anc_k4 | `e3addd28` | 0.170 (0.240) | 0.510 | EAI goal-atom F1 0.071 vs 0.058, p 0.12 (n.s.) | no |
+| quantum | anc_k4 | `d578891e` | 0.178 (0.224) | 0.521 | Qiskit HumanEval 43 vs 19, hard 40 vs 14 | after the token-path fix |
+
+All guards of the released masks are at or above A192p. The masks, `metrics.json` (item-level paired results, CIs) and
+the card are on Hugging Face at `patrickbdevaney/DeepSeek-V4.1-Flash-1017-REAP192-domain-masks`.
 
 ## Dependencies on the parent repo
 
