@@ -138,6 +138,9 @@ def instrument_moe(M, stats_of: dict, group_rows: int = 4096) -> None:
                 _reduce_stats(st, x, valid, bucket, S_buf, queue)
             with torch.no_grad():
                 st.F.update(0, indices[valid], S_buf[valid])
+        rec = getattr(st, "rec", None) if st is not None else None
+        if rec is not None:                     # EASY-EP recorder: routed-only output and per-slot g*||f||
+            rec.moe_done(y, S_buf)
         sh = self.shared_experts
         mid, out = _expert_parts(sh, x, None, x.dtype)
         y += out
@@ -153,6 +156,79 @@ def instrument_moe(M, stats_of: dict, group_rows: int = 4096) -> None:
         return y.type_as(x).view(shape)
 
     M.MoE.forward = forward
+
+
+class EasyEPRec:
+    """EASY-EP recorder (ops/dom/easyep.py; Dong et al. 2025, arXiv 2504.06792), per token of the measured layer:
+
+      gn [n, 6]   c_{i,t} = ||w2(g * act)|| = g_{i,t} ||e_{i,t}|| per routing slot (the S_buf values, which already
+                  carry the valid mask; demo corpora are all-valid); the slot's expert id is s03's routing file
+      cos [n, 2]  col 0 FULL: cos(B, B + post (x) r) over the flattened 4 x 5120 hyper-connection stream, where
+                  B = sum_k comb[j, k] X[k] is the residual hc_post carries forward and r the ROUTED output only
+                  (shared expert excluded, as EASY-EP's x_before_moe vs x + r_moe);
+                  col 1 COLLAPSED: cos(h, h + r) with h = hc_pre(X, attn_pre), the pre-norm single stream the
+                  MoE reads.  EASY-EP's token weight is s_t = max(1 - cos, 0) (their expert_selection.py).
+
+    Wiring: instrument_moe calls moe_done() with the routed sum before the shared expert is added; the Block's
+    hc_pre / hc_post are wrapped (instrument_easyep) so the FFN's hc_pre output is remembered and the hc_post right
+    after an MoE forward is where the cosines are taken. Both wrappers return the original result untouched, so
+    the forward is bit-identical with or without the recorder (ops/tests/test_easyep.py)."""
+
+    def __init__(self, sub_chunk: int = 2048):
+        self.sub_chunk = sub_chunk
+        self.last_pre = None
+        self.r = self.h = None
+        self.gn, self.cos = [], []
+
+    def start_row(self) -> None:
+        self.last_pre = self.r = self.h = None
+        self.gn, self.cos = [], []
+
+    def moe_done(self, y_routed: torch.Tensor, s_buf: torch.Tensor) -> None:
+        self.r = y_routed.detach().float().clone()
+        self.h = self.last_pre
+        self.gn.append(s_buf.detach().float().clone())
+
+    @torch.no_grad()
+    def post(self, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> None:
+        if self.r is None:                       # attention's hc_post: nothing to record
+            return
+        b, s, hc, d = residual.shape
+        r = self.r.view(b, s, d)
+        h = self.h.view(b, s, d) if self.h is not None else None
+        assert h is not None and h.shape[:2] == (b, s), "EASY-EP recorder: hc_pre/MoE/hc_post out of step"
+        out = torch.empty(b, s, 2, dtype=torch.float32, device=residual.device)
+        for a in range(0, s, self.sub_chunk):
+            e = min(s, a + self.sub_chunk)
+            X = residual[:, a:e].float()
+            B = torch.sum(comb[:, a:e].float().unsqueeze(-1) * X.unsqueeze(-2), dim=2)        # [b, n, hc, d]
+            A = B + post[:, a:e].float().unsqueeze(-1) * r[:, a:e].unsqueeze(-2)
+            out[:, a:e, 0] = F.cosine_similarity(B.flatten(-2), A.flatten(-2), dim=-1)
+            hh = h[:, a:e].float()
+            out[:, a:e, 1] = F.cosine_similarity(hh, hh + r[:, a:e], dim=-1)
+        self.cos.append(out.view(b * s, 2))
+        self.r = self.h = None
+
+    def take(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """-> (gn [n, k], cos [n, 2]) for the row, in token order."""
+        return torch.cat(self.gn), torch.cat(self.cos)
+
+
+def instrument_easyep(M, rec: EasyEPRec) -> None:
+    """Wrap M.Block.hc_pre / hc_post for the EASY-EP recorder (see EasyEPRec). Results are returned unchanged."""
+    pre0, post0 = M.Block.hc_pre, M.Block.hc_post
+
+    def hc_pre(self, x, pre_mix):
+        y = pre0(self, x, pre_mix)
+        rec.last_pre = y
+        return y
+
+    def hc_post(self, x, residual, post, comb):
+        y = post0(self, x, residual, post, comb)
+        rec.post(residual, post, comb)
+        return y
+
+    M.Block.hc_pre, M.Block.hc_post = hc_pre, hc_post
 
 
 @torch.no_grad()

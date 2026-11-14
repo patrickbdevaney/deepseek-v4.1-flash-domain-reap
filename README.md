@@ -110,7 +110,7 @@ pre-registered release rule: a mask is released only if its pooled domain score 
 | gamedev | anc_k8 | `448ded42` | 0.095 (0.328) | 0.591 | Rust 115 vs 12 /150, C++ 135 vs 132; pooled p 7e-28 | yes |
 | mlsys | anc_k4 | `fb72251e` | 0.251 (0.284) | 0.537 | KernelBench L1 53 vs 32 /100, p 5e-5 | yes |
 | robotics | anc_k4 | `e3addd28` | 0.170 (0.240) | 0.510 | EAI goal-atom F1 0.071 vs 0.058, p 0.12 (n.s.) | no |
-| quantum | anc_k4 | `d578891e` | 0.178 (0.224) | 0.521 | Qiskit HumanEval 43 vs 19, hard 40 vs 14 | after the token-path fix |
+| quantum | anc_k4 + qiskit token-path (`token_protect.py`) | `d2d7b8f5` | 0.178 (0.224) (base k4) | 0.521 (base k4) | Qiskit HumanEval 79 vs 19, hard 38 vs 14 /138; pooled p 3e-20; misspelled-import failures 59 → 0 vs base k4 | yes |
 
 All guards of the released masks are at or above A192p. The masks, `metrics.json` (item-level paired results, CIs) and
 the card are on Hugging Face at `patrickbdevaney/DeepSeek-V4.1-Flash-1017-REAP192-domain-masks`.

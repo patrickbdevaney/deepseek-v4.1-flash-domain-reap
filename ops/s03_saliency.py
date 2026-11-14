@@ -76,6 +76,9 @@ if DOM:
 # V41_DOM_PASS=<p> (ops/dom/passes.py): one pass over a bucket subset, corpus dom/corpus_<p>, work dir dom/s03_<p>.
 # Every pass banks all len(spec.BUCKETS) buckets (absent ones stay zero), so pass banks merge by summation.
 PASS = os.environ.get("V41_DOM_PASS", "") if DOM else ""
+# V41_EASYEP_REC=1 (domain track only; ops/dom/easyep.py, docs/domain/EASYEP_BASELINE.md): the layer units also
+# record EASY-EP's per-token terms (hooks.EasyEPRec) to <work dir>/easyep/L<L>_{gn,cos}.npy. Unset: no change.
+EASYEP = DOM and os.environ.get("V41_EASYEP_REC") == "1"
 STAGE = "s03"
 CORPUS = env.WORK / "dom" / (f"corpus_{PASS}" if PASS else "corpus") if DOM else env.WORK / "corpus"
 D = env.WORK / "dom" / (f"s03_{PASS}" if PASS else "s03") if DOM else env.WORK / "s03"
@@ -297,6 +300,8 @@ def unit_layer(a):
     import torch
     from ops.lib import memfence, shards
     from ops.lib.hooks import FFNStats, chunked_block, chunked_indexer, instrument_moe
+    if EASYEP:
+        from ops.lib.hooks import EasyEPRec, instrument_easyep
     L = a.layer
     env.assert_no_gpu_server(STAGE)
     M = env.import_reference(a.kernels)
@@ -316,6 +321,10 @@ def unit_layer(a):
     idx.close()
     st = FFNStats(len(STAT_BUCKETS), E, DIM, INTER, "cuda")
     stats_of[id(blk.ffn)] = st
+    rec = None
+    if EASYEP:
+        rec = st.rec = EasyEPRec()
+        instrument_easyep(M, rec)
     # model.py creates some tensors without a device (get_window_topk_idxs); generate.py runs with
     # cuda as the default device, so do the same for the forward
     torch.set_default_device("cuda")
@@ -384,6 +393,8 @@ def unit_layer(a):
         if row["heldout"]:
             valid = torch.zeros_like(valid)
         st.start_row(torch.full((n,), row[STAT_KEY], dtype=torch.long, device="cuda"), valid)
+        if rec is not None:
+            rec.start_row()
         torch.cuda.synchronize(); t1 = time.time(); tm["load"] += t1 - t0
         with torch.inference_mode():
             if blk.engram is not None:
@@ -400,6 +411,10 @@ def unit_layer(a):
             payload["state_" + kind] = grab_state(M, blk, kind, n)
         if tap is not None:
             payload["tap"] = tap.contiguous().view(torch.int16).cpu().numpy()
+        if rec is not None:
+            gn, cos = rec.take()
+            assert gn.shape == (n, K) and cos.shape == (n, 2), (gn.shape, cos.shape, n)
+            payload["ez_gn"], payload["ez_cos"] = gn.cpu().numpy(), cos.cpu().numpy()
         jw.put(jdir / f"r{r:05d}.npz", payload)
         pending[r] = payload
         del x, y, ffn_pre
@@ -545,6 +560,15 @@ def _pwrite_rows(mm_arr: np.memmap, s: slice, data: np.ndarray) -> None:
         os.close(fd)
 
 
+_EZ: dict = {}      # (L, name) -> EASY-EP recorder memmap (V41_EASYEP_REC only)
+
+
+def _ez_mm(L: int, name: str, T: int):
+    if (L, name) not in _EZ:
+        _EZ[(L, name)] = mm(D / "easyep" / f"L{L}_{name}.npy", np.float32, (T, K if name == "gn" else 2))
+    return _EZ[(L, name)]
+
+
 def sync_stream(H, PM, rid, rw) -> None:
     fd = os.open(H.filename, os.O_RDONLY)
     try:
@@ -552,6 +576,8 @@ def sync_stream(H, PM, rid, rw) -> None:
     finally:
         os.close(fd)
     PM.flush(); rid.flush(); rw.flush()
+    for a in _EZ.values():
+        a.flush()
 
 
 def apply_payload(C, r, j: dict, H, PM, rid, rw, L):
@@ -567,6 +593,8 @@ def apply_payload(C, r, j: dict, H, PM, rid, rw, L):
             p = state_path(k[6:], L, r)
             p.parent.mkdir(parents=True, exist_ok=True)
             np.save(p, j[k])
+        elif k.startswith("ez_"):
+            _ez_mm(L, k[3:], C.T)[s] = j[k]
         elif k == "tap":
             p = D / "taps" / f"L{L}" / f"r{r:05d}.npy"
             p.parent.mkdir(parents=True, exist_ok=True)
